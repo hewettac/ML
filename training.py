@@ -1,411 +1,352 @@
-from pathlib import Path
-import textwrap, json, os, zipfile
+# ===== Packages =====
 
-repo_dir = Path("/mnt/data/pneumonia-github-ready")
-repo_dir.mkdir(parents=True, exist_ok=True)
-
-train_py = r'''"""
-Train a CNN to classify chest X-rays as NORMAL or PNEUMONIA.
-
-Usage:
-    python src/train.py --data-dir data/chest_xray --epochs 10 --batch-size 32
-
-Expected dataset structure:
-data/chest_xray/
-    train/
-        NORMAL/
-        PNEUMONIA/
-    val/
-        NORMAL/
-        PNEUMONIA/
-    test/
-        NORMAL/
-        PNEUMONIA/
-"""
-
-import argparse
-import json
-from pathlib import Path
-
+import os
 import cv2
+import numpy as np
 import matplotlib.pyplot as plt
-import numpy as np
+import random
 import tensorflow as tf
-from sklearn.metrics import classification_report, confusion_matrix
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Input, Dense, Dropout, Activation, Flatten, Conv2D, MaxPooling2D
+from tensorflow.keras.layers import RandomRotation, RandomZoom, RandomTranslation, RandomContrast
 from sklearn.utils.class_weight import compute_class_weight
-from tensorflow.keras import Sequential
-from tensorflow.keras.layers import (
-    Activation,
-    Conv2D,
-    Dense,
-    Dropout,
-    Flatten,
-    Input,
-    MaxPooling2D,
-    RandomContrast,
-    RandomRotation,
-    RandomTranslation,
-    RandomZoom,
-)
 from tensorflow.keras.models import load_model
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import classification_report
+#%%
+# ===== Manage and Lock Kaggle Key =====
+
+from google.colab import files
+files.upload()
+
+!mkdir -p ~/.kaggle
+!cp kaggle.json ~/.kaggle/
+!chmod 600 ~/.kaggle/kaggle.json
+#%%
+# ===== Check if Locked =====
+
+# (Look for -rw----------)
+!ls -l ~/.kaggle
+#%%
+# ===== Import Data (Kaggle) =====
+
+!kaggle datasets download -d paultimothymooney/chest-xray-pneumonia
+!unzip chest-xray-pneumonia.zip
+#%%
+# ===== Dataset Contents =====
+
+!ls /content
+!ls /content/chest_xray
+#%%
+# ===== Separate Folder Contents =====
+
+BASE_DIR = "/content/chest_xray/chest_xray"
+
+train_dir = BASE_DIR + "/train"
+test_dir = BASE_DIR + "/test"
+val_dir = BASE_DIR + "/val"
+#%%
+# ===== Validate Images =====
+
+DATADIR = train_dir
+CATEGORIES = ["NORMAL", "PNEUMONIA"]
+
+for category in CATEGORIES:
+    path = os.path.join(DATADIR, category)
+    for image in os.listdir(path):
+        image_array = cv2.imread(os.path.join(path, image), cv2.IMREAD_GRAYSCALE)
+        plt.imshow(image_array, cmap="gray")
+        plt.title(category)
+        plt.axis("off")
+        plt.show()
+        break
+#%%
+# ===== Create Training Dataset =====
+
+training_data =  []
+IMAGE_SIZE = 224
 
 
-CLASS_NAMES = ["NORMAL", "PNEUMONIA"]
+def create_training_data():
+    for category in CATEGORIES:
+        path = os.path.join(DATADIR, category)
+        class_num = CATEGORIES.index(category)
 
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=str, required=True, help="Path to chest_xray dataset root")
-    parser.add_argument("--image-size", type=int, default=224, help="Square resize dimension")
-    parser.add_argument("--epochs", type=int, default=10, help="Training epochs")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
-    parser.add_argument("--validation-split", type=float, default=0.1, help="Validation split if val folder not used")
-    parser.add_argument("--output-dir", type=str, default="artifacts", help="Where model and outputs are saved")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--save-plots", action="store_true", help="Save plots to disk")
-    return parser.parse_args()
-
-
-def set_seed(seed: int):
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
-
-
-def load_split(split_dir: Path, image_size: int):
-    data = []
-    for class_name in CLASS_NAMES:
-        class_dir = split_dir / class_name
-        if not class_dir.exists():
-            raise FileNotFoundError(f"Missing class folder: {class_dir}")
-
-        class_num = CLASS_NAMES.index(class_name)
-        for image_path in class_dir.iterdir():
-            if not image_path.is_file():
-                continue
+        for image in os.listdir(path):
             try:
-                image_array = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+                img_path = os.path.join(path, image)
+
+                image_array = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+
                 if image_array is None:
-                    continue
-                resized = cv2.resize(image_array, (image_size, image_size))
-                data.append((resized, class_num))
-            except Exception:
-                continue
+                    continue  # skip bad files
 
-    if not data:
-        raise ValueError(f"No usable images found in {split_dir}")
+                new_array = cv2.resize(image_array, (IMAGE_SIZE, IMAGE_SIZE))
+                training_data.append([new_array, class_num])
 
-    np.random.shuffle(data)
-    x = np.array([item[0] for item in data], dtype=np.float32).reshape(-1, image_size, image_size, 1) / 255.0
-    y = np.array([item[1] for item in data], dtype=np.int32)
-    return x, y
+            except Exception as e:
+                pass
 
+create_training_data()
+print(len(training_data))
+#%%
+# ===== Shuffle Pneumonia Types =====
 
-def build_model(input_shape):
-    model = Sequential([
-        Input(shape=input_shape),
-        RandomRotation(0.05),
-        RandomZoom(0.10),
-        RandomTranslation(0.05, 0.05),
-        RandomContrast(0.10),
+random.shuffle(training_data)
 
-        Conv2D(64, (3, 3), activation="relu"),
-        MaxPooling2D(pool_size=(2, 2)),
+for sample in training_data[:10]:
+  print(sample[1])
+#%%
+# ===== Image (X) & Labels (y) =====
 
-        Conv2D(64, (3, 3), activation="relu"),
-        MaxPooling2D(pool_size=(2, 2)),
+X = []
+y = []
 
-        Flatten(),
-        Dense(64, activation="relu"),
-        Dropout(0.5),
-        Dense(1, activation="sigmoid"),
-    ])
+for features, label in training_data:
+  X.append(features)
+  y.append(label)
 
-    model.compile(
-        loss="binary_crossentropy",
-        optimizer="adam",
-        metrics=["accuracy"],
-    )
-    return model
+X = np.array(X).reshape(-1, IMAGE_SIZE, IMAGE_SIZE, 1)      # (All Images, Image Height, Image Width, Greyscale)
+y = np.array(y)
 
+X = X / 255.0
 
-def save_class_distribution(y, output_dir: Path):
-    classes, counts = np.unique(y, return_counts=True)
-    plt.figure()
-    bars = plt.bar(classes.astype(str), counts)
-    plt.title("Class Distribution")
-    plt.xlabel("Class (0 = NORMAL, 1 = PNEUMONIA)")
-    plt.ylabel("Number of Images")
+print(X.shape)
+print(y.shape)
+#%%
+# ===== Check Class Imbalance =====
 
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(
-            bar.get_x() + bar.get_width() / 2,
-            height,
-            f"{int(height)}",
-            ha="center",
-            va="bottom",
-        )
+classes, counts = np.unique(y, return_counts=True)
 
-    plt.tight_layout()
-    plt.savefig(output_dir / "class_distribution.png", dpi=150)
-    plt.close()
+plt.figure()
 
+bars = plt.bar(classes.astype(str), counts, color="#7FE8D7")
 
-def save_training_curves(history, output_dir: Path):
-    plt.figure()
-    plt.plot(history.history["accuracy"], label="train_accuracy")
-    if "val_accuracy" in history.history:
-        plt.plot(history.history["val_accuracy"], label="val_accuracy")
-    plt.title("Training Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_dir / "training_accuracy.png", dpi=150)
-    plt.close()
+plt.title("Class Distribution")
+plt.xlabel("Class (0 = NORMAL, 1 = PNEUMONIA)")
+plt.ylabel("Number of Images")
 
-    plt.figure()
-    plt.plot(history.history["loss"], label="train_loss")
-    if "val_loss" in history.history:
-        plt.plot(history.history["val_loss"], label="val_loss")
-    plt.title("Training Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_dir / "training_loss.png", dpi=150)
-    plt.close()
-
-
-def main():
-    args = parse_args()
-    set_seed(args.seed)
-
-    data_dir = Path(args.data_dir)
-    train_dir = data_dir / "train"
-    val_dir = data_dir / "val"
-    test_dir = data_dir / "test"
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    x_train, y_train = load_split(train_dir, args.image_size)
-
-    use_explicit_val = val_dir.exists() and any(val_dir.iterdir())
-    if use_explicit_val:
-        x_val, y_val = load_split(val_dir, args.image_size)
-        validation_data = (x_val, y_val)
-        validation_split = 0.0
-    else:
-        validation_data = None
-        validation_split = args.validation_split
-
-    x_test, y_test = load_split(test_dir, args.image_size)
-
-    class_weights_arr = compute_class_weight(
-        class_weight="balanced",
-        classes=np.unique(y_train),
-        y=y_train,
-    )
-    class_weight = {
-        int(cls): float(weight)
-        for cls, weight in zip(np.unique(y_train), class_weights_arr)
-    }
-
-    model = build_model(x_train.shape[1:])
-
-    history = model.fit(
-        x_train,
-        y_train,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        validation_data=validation_data,
-        validation_split=validation_split,
-        class_weight=class_weight,
-        verbose=1,
+# Add numbers on top of bars
+for bar in bars:
+    height = bar.get_height()
+    plt.text(
+        bar.get_x() + bar.get_width() / 2,
+        height,
+        f"{int(height)}",
+        ha='center',
+        va='bottom'
     )
 
-    eval_loss, eval_acc = model.evaluate(x_test, y_test, verbose=0)
-    y_pred_probs = model.predict(x_test, verbose=0)
-    y_pred = (y_pred_probs > 0.5).astype("int32").flatten()
+plt.show()
+#%%
+# ===== Calculate Weights =====
 
-    cm = confusion_matrix(y_test, y_pred)
-    report = classification_report(y_test, y_pred, target_names=CLASS_NAMES, output_dict=True)
+class_weights_arr = compute_class_weight(
+    class_weight="balanced",
+    classes=np.unique(y),
+    y=y)
 
-    model_path = output_dir / "pneumonia_model.keras"
-    model.save(model_path)
+class_weight = {
+    int(cls): float(weight)
+    for cls, weight in zip(np.unique(y), class_weights_arr)}
 
-    metadata = {
-        "img_size": [args.image_size, args.image_size],
-        "class_names": CLASS_NAMES,
-        "test_loss": float(eval_loss),
-        "test_accuracy": float(eval_acc),
-        "class_weight": class_weight,
-    }
+print("Class Weights:", class_weight)
+#%%
+# ===== Build Model =====
 
-    with open(output_dir / "model_metadata.json", "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
+# Base Model
+model = Sequential()
 
-    with open(output_dir / "classification_report.json", "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
+model.add(Input(shape=X.shape[1:]))
 
-    np.save(output_dir / "confusion_matrix.npy", cm)
+# Augmentations
+model.add(RandomRotation(0.05))
+model.add(RandomZoom(0.10))
+model.add(RandomTranslation(0.05, 0.05))
+model.add(RandomContrast(0.10))
 
-    if args.save_plots:
-        save_class_distribution(y_train, output_dir)
-        save_training_curves(history, output_dir)
+# Layer 1
+model.add(Conv2D(64, (3,3)))
+model.add(Activation("relu"))
+model.add(MaxPooling2D(pool_size=(2,2)))
 
-    print(f"Saved model to: {model_path}")
-    print(f"Test loss: {eval_loss:.4f}")
-    print(f"Test accuracy: {eval_acc:.4f}")
-    print("\nConfusion Matrix:")
-    print(cm)
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred, target_names=CLASS_NAMES))
+# Layer 2
+model.add(Conv2D(64, (3,3)))
+model.add(Activation("relu"))
+model.add(MaxPooling2D(pool_size=(2,2)))
 
+# Single Vector
+model.add(Flatten())
 
-if __name__ == "__main__":
-    main()
-'''
+# Combine Knowledge
+model.add(Dense(64))
+model.add(Activation("relu"))
+model.add(Dropout(0.5))
 
-predict_py = r'''"""
-Run prediction on a single chest X-ray image.
+# Output Layer
+model.add(Dense(1))
+model.add(Activation("sigmoid"))
 
-Usage:
-    python src/predict.py --image path/to/image.jpeg --model artifacts/pneumonia_model.keras
-"""
+# Compile Model
+model.compile(loss = "binary_crossentropy",
+              optimizer = "adam",
+              metrics = ['accuracy'])
 
-import argparse
-import json
-from pathlib import Path
+# Train Model
+history = model.fit(
+    X,
+    y,
+    batch_size=32,
+    epochs=1,
+    validation_split=0.1,
+    class_weight=class_weight
+)
 
-import cv2
-import numpy as np
-from tensorflow.keras.models import load_model
+# Save Model
+model.save("CNN.keras")
+#%%
+# ===== Load Saved Model =====
 
+cnn_model = load_model("CNN.keras")
+#%%
+# ===== Preparing Single Image =====
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image", type=str, required=True, help="Path to image file")
-    parser.add_argument("--model", type=str, default="artifacts/pneumonia_model.keras", help="Path to trained model")
-    parser.add_argument("--metadata", type=str, default="artifacts/model_metadata.json", help="Path to metadata JSON")
-    return parser.parse_args()
+def prepare_image(filepath):
+    IMAGE_SIZE = 224
 
-
-def prepare_image(filepath: str, image_size: int):
     img_array = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
+
     if img_array is None:
         raise ValueError(f"Could not read image: {filepath}")
 
-    img_resized = cv2.resize(img_array, (image_size, image_size))
-    img_normalized = img_resized.astype(np.float32) / 255.0
-    img_reshaped = img_normalized.reshape(-1, image_size, image_size, 1)
+    img_resized = cv2.resize(img_array, (IMAGE_SIZE, IMAGE_SIZE))
+    img_normalized = img_resized / 255.0
+    img_reshaped = img_normalized.reshape(-1, IMAGE_SIZE, IMAGE_SIZE, 1)
+
     return img_reshaped
+#%%
+# ===== Pick Random Test Image =====
 
+# Normal
+normal_test_path = test_dir + "/NORMAL"
 
-def main():
-    args = parse_args()
+random_image = random.choice(os.listdir(normal_test_path))
 
-    model = load_model(args.model)
+image_path_n = os.path.join(normal_test_path, random_image)
 
-    with open(args.metadata, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
+print(image_path_n)
 
-    image_size = metadata["img_size"][0]
-    class_names = metadata["class_names"]
+# Pneumonia
+pneumonia_test_path = test_dir + "/PNEUMONIA"
 
-    image_batch = prepare_image(args.image, image_size)
-    prediction = model.predict(image_batch, verbose=0)
-    score = float(prediction[0][0])
+random_image = random.choice(os.listdir(pneumonia_test_path))
 
-    label = class_names[1] if score > 0.5 else class_names[0]
-    normal_prob = 1.0 - score
-    pneumonia_prob = score
+image_path_p = os.path.join(pneumonia_test_path, random_image)
 
-    print(f"Image: {Path(args.image).name}")
-    print(f"Prediction: {label}")
-    print(f"Normal probability: {normal_prob:.6f}")
-    print(f"Pneumonia probability: {pneumonia_prob:.6f}")
+print(image_path_p)
+#%%
+# ===== Predict Test Image =====
 
+# Normal
+prediction_n = model.predict(prepare_image(image_path_n))
+score_n = float(prediction_n[0][0])
 
-if __name__ == "__main__":
-    main()
-'''
+if score_n > 0.5:
+    label_n = "PNEUMONIA"
+else:
+    label_n = "NORMAL"
 
-download_script = r'''"""
-Download the Kaggle chest X-ray pneumonia dataset.
+print(f"Prediction: {label_n}")
+print(f"Pneumonia Probability: {score_n:.6f}")
 
-Usage:
-    python src/download_data.py --kaggle-json /path/to/kaggle.json --output-dir data
-"""
+# Pneumonia
+prediction_p = model.predict(prepare_image(image_path_p))
+score_p = float(prediction_p[0][0])
 
-import argparse
-import shutil
-import subprocess
-from pathlib import Path
+if score_p > 0.5:
+    label_p = "PNEUMONIA"
+else:
+    label_p = "NORMAL"
 
+print(f"Prediction: {label_p}")
+print(f"Pneumonia Probability: {score_p:.6f}")
+#%%
+# ===== Output =====
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--kaggle-json", type=str, required=True, help="Path to kaggle.json")
-    parser.add_argument("--output-dir", type=str, default="data", help="Directory where data will be downloaded")
-    return parser.parse_args()
+# Normal
+img = cv2.imread(image_path_n, cv2.IMREAD_GRAYSCALE)
 
+if img is None:
+    raise ValueError("Image not found")
 
-def main():
-    args = parse_args()
+plt.imshow(img, cmap="gray")
+plt.title(f"{label_n} (Pneumonia Probability: {score_n:.5f})")
+plt.axis("off")
+plt.show()
 
-    kaggle_json = Path(args.kaggle_json)
-    if not kaggle_json.exists():
-        raise FileNotFoundError(f"kaggle.json not found: {kaggle_json}")
+# Pneumonia
+img = cv2.imread(image_path_p, cv2.IMREAD_GRAYSCALE)
 
-    kaggle_dir = Path.home() / ".kaggle"
-    kaggle_dir.mkdir(parents=True, exist_ok=True)
+if img is None:
+    raise ValueError("Image not found")
 
-    dest = kaggle_dir / "kaggle.json"
-    shutil.copy2(kaggle_json, dest)
-    dest.chmod(0o600)
+plt.imshow(img, cmap="gray")
+plt.title(f"{label_p} (Pneumonia Probability: {score_p:.5f})")
+plt.axis("off")
+plt.show()
+#%%
+# ===== Create Test Set =====
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+test_data = []
 
-    subprocess.run(
-        [
-            "kaggle",
-            "datasets",
-            "download",
-            "-d",
-            "paultimothymooney/chest-xray-pneumonia",
-            "-p",
-            str(output_dir),
-            "--unzip",
-        ],
-        check=True,
-    )
+def create_test_data():
+    for category in CATEGORIES:
+        path = os.path.join(test_dir, category)
+        class_num = CATEGORIES.index(category)
 
-    print(f"Dataset downloaded to: {output_dir}")
+        for image in os.listdir(path):
+            try:
+                img_path = os.path.join(path, image)
+                img_array = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
 
+                if img_array is None:
+                    continue
 
-if __name__ == "__main__":
-    main()
-'''
+                new_array = cv2.resize(img_array, (IMAGE_SIZE, IMAGE_SIZE))
+                test_data.append([new_array, class_num])
 
-requirements_txt = """tensorflow>=2.14
-numpy>=1.24
-matplotlib>=3.7
-opencv-python>=4.8
-scikit-learn>=1.3
-kaggle>=1.6
-"""
+            except Exception:
+                pass
 
-readme_md = """# Chest X-Ray Pneumonia Classifier
+create_test_data()
+print(len(test_data))
+#%%
+# ===== Shuffle Test Data =====
 
-This repo trains a CNN that classifies chest X-rays as **NORMAL** or **PNEUMONIA**.
+random.shuffle(test_data)
+#%%
+# ===== Create X and y Sets =====
 
-## 1. Clone the repo
+X_test = []
+y_test = []
 
-```bash
-git clone <your-repo-url>
-cd pneumonia-github-ready
+for features, label in test_data:
+    X_test.append(features)
+    y_test.append(label)
 
+X_test = np.array(X_test).reshape(-1, IMAGE_SIZE, IMAGE_SIZE, 1)
+y_test = np.array(y_test)
 
-model.save("pneumonia_model.keras")
+X_test = X_test / 255.0
+#%%
+# ===== Model Predictions =====
+
+y_pred_probs = model.predict(X_test)
+y_pred = (y_pred_probs > 0.5).astype("int32").flatten()
+#%%
+# ===== Confusion Matrix and Report =====
+
+cm = confusion_matrix(y_test, y_pred)
+print(cm)
+
+print(classification_report(y_test, y_pred, target_names=CATEGORIES))
