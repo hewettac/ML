@@ -406,3 +406,6 @@ This repo trains a CNN that classifies chest X-rays as **NORMAL** or **PNEUMONIA
 ```bash
 git clone <your-repo-url>
 cd pneumonia-github-ready
+
+
+model.save("pneumonia_model.keras")
