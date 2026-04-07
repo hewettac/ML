@@ -1,0 +1,10 @@
+{
+  "img_size": [224, 224],
+  "class_names": ["NORMAL", "PNEUMONIA"],
+  "test_loss": 0.32,
+  "test_accuracy": 0.89,
+  "class_weight": {
+    "0": 1.2,
+    "1": 0.8
+  }
+}
