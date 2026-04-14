@@ -1,352 +1,168 @@
-# ===== Packages =====
+#%%
+import zipfile
+from pathlib import Path
 
-import os
 import cv2
+import keras
 import numpy as np
-import matplotlib.pyplot as plt
-import random
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Input, Dense, Dropout, Activation, Flatten, Conv2D, MaxPooling2D
-from tensorflow.keras.layers import RandomRotation, RandomZoom, RandomTranslation, RandomContrast
-from sklearn.utils.class_weight import compute_class_weight
-from tensorflow.keras.models import load_model
-from sklearn.metrics import confusion_matrix
-from sklearn.metrics import classification_report
-#%%
-# ===== Manage and Lock Kaggle Key =====
+import streamlit as st
+from PIL import Image
 
-from google.colab import files
-files.upload()
-
-!mkdir -p ~/.kaggle
-!cp kaggle.json ~/.kaggle/
-!chmod 600 ~/.kaggle/kaggle.json
-#%%
-# ===== Check if Locked =====
-
-# (Look for -rw----------)
-!ls -l ~/.kaggle
-#%%
-# ===== Import Data (Kaggle) =====
-
-!kaggle datasets download -d paultimothymooney/chest-xray-pneumonia
-!unzip chest-xray-pneumonia.zip
-#%%
-# ===== Dataset Contents =====
-
-!ls /content
-!ls /content/chest_xray
-#%%
-# ===== Separate Folder Contents =====
-
-BASE_DIR = "/content/chest_xray/chest_xray"
-
-train_dir = BASE_DIR + "/train"
-test_dir = BASE_DIR + "/test"
-val_dir = BASE_DIR + "/val"
-#%%
-# ===== Validate Images =====
-
-DATADIR = train_dir
-CATEGORIES = ["NORMAL", "PNEUMONIA"]
-
-for category in CATEGORIES:
-    path = os.path.join(DATADIR, category)
-    for image in os.listdir(path):
-        image_array = cv2.imread(os.path.join(path, image), cv2.IMREAD_GRAYSCALE)
-        plt.imshow(image_array, cmap="gray")
-        plt.title(category)
-        plt.axis("off")
-        plt.show()
-        break
-#%%
-# ===== Create Training Dataset =====
-
-training_data =  []
 IMAGE_SIZE = 224
+MODEL_CANDIDATES = [Path("CNN.keras"), Path("CNN.h5")]
+CLASS_NAMES = {0: "NORMAL", 1: "PNEUMONIA"}
 
 
-def create_training_data():
-    for category in CATEGORIES:
-        path = os.path.join(DATADIR, category)
-        class_num = CATEGORIES.index(category)
+@st.cache_resource
+def load_cnn_model(model_path: str):
+    return keras.models.load_model(model_path)
 
-        for image in os.listdir(path):
-            try:
-                img_path = os.path.join(path, image)
 
-                image_array = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+def find_model_file() -> Path | None:
+    for path in MODEL_CANDIDATES:
+        if path.exists():
+            return path
+    return None
 
-                if image_array is None:
-                    continue  # skip bad files
 
-                new_array = cv2.resize(image_array, (IMAGE_SIZE, IMAGE_SIZE))
-                training_data.append([new_array, class_num])
+def describe_model_file(model_path: Path) -> dict:
+    info = {
+        "name": model_path.name,
+        "size_bytes": model_path.stat().st_size,
+        "is_zip_based_keras": False,
+        "zip_contents": [],
+    }
 
-            except Exception as e:
-                pass
+    if model_path.suffix == ".keras":
+        try:
+            with zipfile.ZipFile(model_path, "r") as zf:
+                info["is_zip_based_keras"] = True
+                info["zip_contents"] = zf.namelist()
+        except Exception:
+            info["is_zip_based_keras"] = False
 
-create_training_data()
-print(len(training_data))
-#%%
-# ===== Shuffle Pneumonia Types =====
+    return info
 
-random.shuffle(training_data)
 
-for sample in training_data[:10]:
-  print(sample[1])
-#%%
-# ===== Image (X) & Labels (y) =====
+def preprocess_uploaded_image(uploaded_file) -> tuple[np.ndarray, np.ndarray]:
+    image = Image.open(uploaded_file).convert("L")
+    image_np = np.array(image)
 
-X = []
-y = []
+    resized = cv2.resize(image_np, (IMAGE_SIZE, IMAGE_SIZE))
+    normalized = resized.astype("float32") / 255.0
+    model_input = normalized.reshape(1, IMAGE_SIZE, IMAGE_SIZE, 1)
 
-for features, label in training_data:
-  X.append(features)
-  y.append(label)
+    return image_np, model_input
 
-X = np.array(X).reshape(-1, IMAGE_SIZE, IMAGE_SIZE, 1)      # (All Images, Image Height, Image Width, Greyscale)
-y = np.array(y)
 
-X = X / 255.0
+def predict_image(model, model_input: np.ndarray) -> dict:
+    raw_pred = model.predict(model_input, verbose=0)
+    pneumonia_prob = float(raw_pred[0][0])
+    normal_prob = 1.0 - pneumonia_prob
 
-print(X.shape)
-print(y.shape)
-#%%
-# ===== Check Class Imbalance =====
+    predicted_class = 1 if pneumonia_prob >= 0.5 else 0
+    predicted_label = CLASS_NAMES[predicted_class]
+    confidence = pneumonia_prob if predicted_class == 1 else normal_prob
 
-classes, counts = np.unique(y, return_counts=True)
+    return {
+        "predicted_label": predicted_label,
+        "predicted_class": predicted_class,
+        "confidence": confidence,
+        "pneumonia_prob": pneumonia_prob,
+        "normal_prob": normal_prob,
+    }
 
-plt.figure()
 
-bars = plt.bar(classes.astype(str), counts, color="#7FE8D7")
+st.set_page_config(page_title="Chest X-Ray Pneumonia Detector", layout="centered")
 
-plt.title("Class Distribution")
-plt.xlabel("Class (0 = NORMAL, 1 = PNEUMONIA)")
-plt.ylabel("Number of Images")
-
-# Add numbers on top of bars
-for bar in bars:
-    height = bar.get_height()
-    plt.text(
-        bar.get_x() + bar.get_width() / 2,
-        height,
-        f"{int(height)}",
-        ha='center',
-        va='bottom'
-    )
-
-plt.show()
-#%%
-# ===== Calculate Weights =====
-
-class_weights_arr = compute_class_weight(
-    class_weight="balanced",
-    classes=np.unique(y),
-    y=y)
-
-class_weight = {
-    int(cls): float(weight)
-    for cls, weight in zip(np.unique(y), class_weights_arr)}
-
-print("Class Weights:", class_weight)
-#%%
-# ===== Build Model =====
-
-# Base Model
-model = Sequential()
-
-model.add(Input(shape=X.shape[1:]))
-
-# Augmentations
-model.add(RandomRotation(0.05))
-model.add(RandomZoom(0.10))
-model.add(RandomTranslation(0.05, 0.05))
-model.add(RandomContrast(0.10))
-
-# Layer 1
-model.add(Conv2D(64, (3,3)))
-model.add(Activation("relu"))
-model.add(MaxPooling2D(pool_size=(2,2)))
-
-# Layer 2
-model.add(Conv2D(64, (3,3)))
-model.add(Activation("relu"))
-model.add(MaxPooling2D(pool_size=(2,2)))
-
-# Single Vector
-model.add(Flatten())
-
-# Combine Knowledge
-model.add(Dense(64))
-model.add(Activation("relu"))
-model.add(Dropout(0.5))
-
-# Output Layer
-model.add(Dense(1))
-model.add(Activation("sigmoid"))
-
-# Compile Model
-model.compile(loss = "binary_crossentropy",
-              optimizer = "adam",
-              metrics = ['accuracy'])
-
-# Train Model
-history = model.fit(
-    X,
-    y,
-    batch_size=32,
-    epochs=1,
-    validation_split=0.1,
-    class_weight=class_weight
+st.title("Chest X-Ray Pneumonia Detector")
+st.write(
+    "Upload a JPEG or PNG chest X-ray image to classify it as NORMAL or PNEUMONIA "
+    "using your trained CNN model."
 )
 
-# Save Model
-model.save("CNN.keras")
-#%%
-# ===== Load Saved Model =====
+with st.expander("Important notes"):
+    st.markdown(
+        """
+        - This app looks for `CNN.keras` first, then `CNN.h5`.
+        - Put this app file and your model file in the same folder before running the app.
+        - The model was trained on **grayscale 224x224** images, so uploads are converted automatically.
+        - This is a demo/inference app and should **not** be used for medical diagnosis.
+        """
+    )
 
-cnn_model = load_model("CNN.keras")
-#%%
-# ===== Preparing Single Image =====
+model_path = find_model_file()
 
-def prepare_image(filepath):
-    IMAGE_SIZE = 224
-
-    img_array = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
-
-    if img_array is None:
-        raise ValueError(f"Could not read image: {filepath}")
-
-    img_resized = cv2.resize(img_array, (IMAGE_SIZE, IMAGE_SIZE))
-    img_normalized = img_resized / 255.0
-    img_reshaped = img_normalized.reshape(-1, IMAGE_SIZE, IMAGE_SIZE, 1)
-
-    return img_reshaped
-#%%
-# ===== Pick Random Test Image =====
-
-# Normal
-normal_test_path = test_dir + "/NORMAL"
-
-random_image = random.choice(os.listdir(normal_test_path))
-
-image_path_n = os.path.join(normal_test_path, random_image)
-
-print(image_path_n)
-
-# Pneumonia
-pneumonia_test_path = test_dir + "/PNEUMONIA"
-
-random_image = random.choice(os.listdir(pneumonia_test_path))
-
-image_path_p = os.path.join(pneumonia_test_path, random_image)
-
-print(image_path_p)
-#%%
-# ===== Predict Test Image =====
-
-# Normal
-prediction_n = model.predict(prepare_image(image_path_n))
-score_n = float(prediction_n[0][0])
-
-if score_n > 0.5:
-    label_n = "PNEUMONIA"
+if model_path is None:
+    st.error(
+        "No model file was found. Put `CNN.keras` or `CNN.h5` in the same folder as this app."
+    )
+    st.stop()
 else:
-    label_n = "NORMAL"
+    model_info = describe_model_file(model_path)
 
-print(f"Prediction: {label_n}")
-print(f"Pneumonia Probability: {score_n:.6f}")
+    with st.expander("Model file diagnostics"):
+        st.write(f"**Detected model file:** `{model_info['name']}`")
+        st.write(f"**Size:** {model_info['size_bytes']:,} bytes")
+        if model_path.suffix == ".keras":
+            st.write(f"**ZIP-based Keras file:** {model_info['is_zip_based_keras']}")
+            if model_info["zip_contents"]:
+                st.write("**Archive contents:**")
+                st.code("\n".join(model_info["zip_contents"]))
 
-# Pneumonia
-prediction_p = model.predict(prepare_image(image_path_p))
-score_p = float(prediction_p[0][0])
+    try:
+        model = load_cnn_model(str(model_path))
+        st.success(f"Loaded model successfully from `{model_path.name}`")
+    except Exception as exc:
+        st.error(f"Could not load model: {exc}")
+        st.info(
+            "Your model file appears valid, so this is likely an environment/version mismatch. "
+            "Use the updated requirements file and reinstall dependencies."
+        )
+        st.stop()
 
-if score_p > 0.5:
-    label_p = "PNEUMONIA"
-else:
-    label_p = "NORMAL"
+    uploaded_file = st.file_uploader(
+        "Upload a chest X-ray image",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=False,
+    )
 
-print(f"Prediction: {label_p}")
-print(f"Pneumonia Probability: {score_p:.6f}")
-#%%
-# ===== Output =====
+    threshold = st.slider(
+        "Prediction threshold for pneumonia",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.5,
+        step=0.01,
+        help="If pneumonia probability is greater than or equal to this threshold, the app predicts PNEUMONIA.",
+    )
 
-# Normal
-img = cv2.imread(image_path_n, cv2.IMREAD_GRAYSCALE)
+    if uploaded_file is not None:
+        try:
+            display_image, model_input = preprocess_uploaded_image(uploaded_file)
+            results = predict_image(model, model_input)
 
-if img is None:
-    raise ValueError("Image not found")
+            predicted_label = (
+                "PNEUMONIA" if results["pneumonia_prob"] >= threshold else "NORMAL"
+            )
+            confidence = (
+                results["pneumonia_prob"]
+                if predicted_label == "PNEUMONIA"
+                else results["normal_prob"]
+            )
 
-plt.imshow(img, cmap="gray")
-plt.title(f"{label_n} (Pneumonia Probability: {score_n:.5f})")
-plt.axis("off")
-plt.show()
+            st.subheader("Uploaded Image")
+            st.image(display_image, caption="Uploaded chest X-ray", use_container_width=True)
 
-# Pneumonia
-img = cv2.imread(image_path_p, cv2.IMREAD_GRAYSCALE)
+            st.subheader("Prediction Result")
+            if predicted_label == "PNEUMONIA":
+                st.error(f"Prediction: {predicted_label}")
+            else:
+                st.success(f"Prediction: {predicted_label}")
 
-if img is None:
-    raise ValueError("Image not found")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Confidence", f"{confidence:.2%}")
+            col2.metric("Pneumonia Probability", f"{results['pneumonia_prob']:.2%}")
+            col3.metric("Normal Probability", f"{results['normal_prob']:.2%}")
 
-plt.imshow(img, cmap="gray")
-plt.title(f"{label_p} (Pneumonia Probability: {score_p:.5f})")
-plt.axis("off")
-plt.show()
-#%%
-# ===== Create Test Set =====
-
-test_data = []
-
-def create_test_data():
-    for category in CATEGORIES:
-        path = os.path.join(test_dir, category)
-        class_num = CATEGORIES.index(category)
-
-        for image in os.listdir(path):
-            try:
-                img_path = os.path.join(path, image)
-                img_array = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-
-                if img_array is None:
-                    continue
-
-                new_array = cv2.resize(img_array, (IMAGE_SIZE, IMAGE_SIZE))
-                test_data.append([new_array, class_num])
-
-            except Exception:
-                pass
-
-create_test_data()
-print(len(test_data))
-#%%
-# ===== Shuffle Test Data =====
-
-random.shuffle(test_data)
-#%%
-# ===== Create X and y Sets =====
-
-X_test = []
-y_test = []
-
-for features, label in test_data:
-    X_test.append(features)
-    y_test.append(label)
-
-X_test = np.array(X_test).reshape(-1, IMAGE_SIZE, IMAGE_SIZE, 1)
-y_test = np.array(y_test)
-
-X_test = X_test / 255.0
-#%%
-# ===== Model Predictions =====
-
-y_pred_probs = model.predict(X_test)
-y_pred = (y_pred_probs > 0.5).astype("int32").flatten()
-#%%
-# ===== Confusion Matrix and Report =====
-
-cm = confusion_matrix(y_test, y_pred)
-print(cm)
-
-print(classification_report(y_test, y_pred, target_names=CATEGORIES))
+        except Exception as exc:
+            st.error(f"Prediction failed: {exc}")
