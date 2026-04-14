@@ -1,0 +1,1 @@
+{"img_size": [64, 64], "class_names": ["NORMAL", "PNEUMONIA"], "threshold": 0.55}
